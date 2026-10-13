@@ -10,4 +10,4 @@ codegen-units = 1
 strip = true
 
 [dependencies]
-sdl2 = "0.35.2"
+sdl2 = "0.38.0"

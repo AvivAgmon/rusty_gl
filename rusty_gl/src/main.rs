@@ -29,7 +29,7 @@ fn main() {
             y: 0.0,
             z: 1.0,
         },
-        brightness: 1f32,
+        brightness: 4f32,
         color: Color {
             r: 255,
             g: 255,
@@ -44,7 +44,22 @@ fn main() {
             y: 0.0,
             z: 1.0,
         },
-        brightness: 1f32,
+        brightness: 4f32,
+        color: Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        },
+        coefficients: (1.0, 1.0, 1.0),
+    }));
+    lights.push(Light::Point(PointLight {
+        origin_point: Point3 {
+            x: 0.5,
+            y: 0.5,
+            z: 7.5,
+        },
+        brightness: 3f32,
         color: Color {
             r: 255,
             g: 255,
@@ -55,8 +70,9 @@ fn main() {
     }));
 
     let mut objs: MeshLoader = MeshLoader(Vec::new());
-    objs.load_obj_file("cone.obj").unwrap();
-
+    objs.load_obj_file("monkey.obj").unwrap();
+    objs.0.iter_mut().for_each(|mesh| mesh.update_origin_point());
+    println!("{:#?}", objs.0[0].origin_point);
     let mut camera = Camera::init(
         Point3 {
             x: 0.0,
@@ -75,7 +91,7 @@ fn main() {
     let video_subsystem = sdl_context.video().unwrap();
 
     let window: Window = video_subsystem
-        .window("rusty_gl", 1000, 1000)
+        .window("rusty_gl", 3000, 3000)
         .resizable()
         .position_centered()
         .build()
@@ -85,7 +101,7 @@ fn main() {
     let mut event_pump = sdl_context.event_pump().unwrap();
 
     'running: loop {
-        
+        objs.0.iter_mut().for_each(|mesh| mesh.rotate_y(0.1));
         points = Buffer::init();
         points.load_meshes(&objs.0);
 
@@ -131,5 +147,6 @@ fn main() {
         canvas.clear();
         canvas.draw_triangles_multi_threaded(points, &mut camera, &lights, 1).unwrap();
         canvas.present();
+
     }
 }

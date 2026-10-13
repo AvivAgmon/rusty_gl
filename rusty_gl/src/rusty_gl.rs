@@ -87,7 +87,7 @@ impl Point3 {
         let z = point.z;
 
         point.y = y * a.cos() - z * a.sin();
-        point.z = z * a.sin() + z * a.cos();
+        point.z = y * a.sin() + z * a.cos();
 
         point.y += origin_point.y;
         point.z += origin_point.z;
@@ -126,8 +126,8 @@ impl Point3 {
         point.x = x * a.cos() - y * a.sin();
         point.y = x * a.sin() + y * a.cos();
 
-        point.x -= origin_point.x;
-        point.y -= origin_point.y;
+        point.x += origin_point.x;
+        point.y += origin_point.y;
         point
     }
 
@@ -166,7 +166,7 @@ impl Point3 {
     }
 
     fn get_dot_product(point1: &Point3, point2: &Point3) -> f32 {
-        point1.x * point2.x + point1.y * point2.y + point1.z + point2.z
+        point1.x * point2.x + point1.y * point2.y + point1.z * point2.z
     }
 
     fn normalize_vector(point: Point3) -> Point3 {
@@ -266,6 +266,20 @@ pub struct TriangleProjected {
     color: Option<Color>,
 }
 
+fn sort_far_to_near(triangles: &mut [Triangle], camera: &Camera) {
+    triangles.sort_by_cached_key(|t| {
+        std::cmp::Reverse(ordered_f32(
+            Camera::perform_transformations(t.origin_point, camera).z,
+        ))
+    });
+}
+
+/// Maps an f32 to a u32 whose integer order matches `f32::total_cmp`.
+fn ordered_f32(f: f32) -> u32 {
+    let bits = f.to_bits();
+    if bits >> 31 == 1 { !bits } else { bits | (1 << 31) }
+}
+
 pub trait MeshAndBuffer {
     fn sort_triangles_in_mesh_origin_point_z_distance_from_camera(
         &mut self,
@@ -292,31 +306,7 @@ impl MeshAndBuffer for Mesh {
             return Err(());
         }
 
-        let check = self
-            .triangles
-            .iter_mut()
-            .try_for_each(|a| -> Result<(), ()> {
-                a.origin_point = Point3 {
-                    x: a.origin_point.x - camera.origin_point.x,
-                    y: a.origin_point.y - camera.origin_point.y,
-                    z: a.origin_point.z - camera.origin_point.z,
-                };
-                Ok(())
-            });
-        if check == Err(()) {
-            return Err(());
-        }
-
-        self.triangles
-            .sort_by(|a, b| b.origin_point.z.partial_cmp(&a.origin_point.z).unwrap());
-
-        self.triangles.iter_mut().for_each(|a| {
-            a.origin_point = Point3 {
-                x: a.origin_point.x - camera.origin_point.x,
-                y: a.origin_point.y - camera.origin_point.y,
-                z: a.origin_point.z - camera.origin_point.z,
-            }
-        });
+        sort_far_to_near(&mut self.triangles, camera);
         Ok(())
     }
 }
@@ -434,11 +424,13 @@ impl Mesh {
 
     pub fn update_normals(&mut self) {
         self.triangles.iter_mut().for_each(|a| {
-            a.normal = Triangle::calc_normal([
-                self.points[a.point1],
-                self.points[a.point2],
-                self.points[a.point3],
-            ])
+            let (p1, p2, p3) = (self.points[a.point1], self.points[a.point2], self.points[a.point3]);
+            a.normal = Triangle::calc_normal([p1, p2, p3]);
+            a.origin_point = Point3 {
+                x: (p1.x + p2.x + p3.x) / 3.0,
+                y: (p1.y + p2.y + p3.y) / 3.0,
+                z: (p1.z + p2.z + p3.z) / 3.0,
+            };
         });
     }
 
@@ -449,7 +441,7 @@ impl Mesh {
     pub fn bake(&mut self, lights: &[Light]) {
         self.triangles.iter_mut().for_each(|a| {
             a.color_baked = Some(Light::apply_shading_multiple_lights(
-                &a.color, &a.normal, lights,
+                &a.color, &a.origin_point, &a.normal, lights,
             ))
         })
     }
@@ -506,24 +498,7 @@ impl MeshAndBuffer for Buffer {
             return Err(());
         }
 
-        self.triangles.iter_mut().for_each(|a| {
-            a.origin_point = Point3 {
-                x: a.origin_point.x - camera.origin_point.x,
-                y: a.origin_point.y - camera.origin_point.y,
-                z: a.origin_point.z - camera.origin_point.z,
-            };
-        });
-
-        self.triangles
-            .sort_by(|a, b| b.origin_point.z.partial_cmp(&a.origin_point.z).unwrap());
-
-        self.triangles.iter_mut().for_each(|a| {
-            a.origin_point = Point3 {
-                x: a.origin_point.x - camera.origin_point.x,
-                y: a.origin_point.y - camera.origin_point.y,
-                z: a.origin_point.z - camera.origin_point.z,
-            }
-        });
+        sort_far_to_near(&mut self.triangles, camera);
         Ok(())
     }
 }
@@ -597,24 +572,30 @@ pub struct PointLight {
     pub color: Color,
 }
 impl PointLight {
-    fn apply_shading(color: &Color, normal: &Point3, light: &PointLight) -> Color {
-        let d = Point3::calculate_distance(normal, &light.origin_point).powi(2);
-        if light.brightness / 10.0 >= d.sqrt() {
-            return *color;
+    /// Flat Lambert diffuse term for a surface at `position` facing `normal`
+    /// (both in world space), as a linear RGB factor in 0..=1 per channel.
+    /// `coefficients` are the attenuation terms (constant, linear, quadratic).
+    fn diffuse(&self, position: &Point3, normal: &Point3) -> (f32, f32, f32) {
+        let to_light = Point3 {
+            x: self.origin_point.x - position.x,
+            y: self.origin_point.y - position.y,
+            z: self.origin_point.z - position.z,
+        };
+        let dist = (to_light.x.powi(2) + to_light.y.powi(2) + to_light.z.powi(2)).sqrt();
+        if dist <= f32::EPSILON {
+            return (0.0, 0.0, 0.0);
         }
 
-        let c = Point3::get_dot_product(normal, &light.origin_point);
+        let n_dot_l = Point3::get_dot_product(normal, &to_light) / dist;
+        if n_dot_l <= 0.0 {
+            return (0.0, 0.0, 0.0);
+        }
 
-        let converted_color = Color::convert_255_1(color);
-        let converted_light = Color::convert_255_1(&light.color);
-
-        let c = (
-            converted_color.0 * converted_light.0 * (c / d) * light.brightness,
-            converted_color.1 * converted_light.1 * (c / d) * light.brightness,
-            converted_color.2 * converted_light.2 * (c / d) * light.brightness,
-            converted_color.3,
-        );
-        Color::convert_1_255(&c)
+        let (c, l, q) = self.coefficients;
+        let attenuation = 1.0 / (c + l * dist + q * dist * dist).max(f32::EPSILON);
+        let k = n_dot_l * attenuation * self.brightness;
+        let light = Color::convert_255_1(&self.color);
+        (light.0 * k, light.1 * k, light.2 * k)
     }
 }
 
@@ -624,21 +605,35 @@ pub enum Light {
 }
 
 impl Light {
-    fn apply_shading_multiple_lights(color: &Color, normal: &Point3, lights: &[Light]) -> Color {
-        let mut c = (0.0, 0.0, 0.0, 255.0);
-        lights.iter().for_each(|a| {
-            let temp = Color::convert_255_1(&Light::apply_shading(color, normal, a));
-            c.0 += temp.0;
-            c.1 += temp.1;
-            c.2 += temp.2;
-        });
-        Color::convert_1_255(&c)
-    }
+    /// Light that every surface receives, so faces turned away from all lights
+    /// are dark but not pure black.
+    const AMBIENT: f32 = 0.08;
 
-    fn apply_shading(color: &Color, normal: &Point3, light: &Light) -> Color {
-        match light {
-            Light::Point(x) => PointLight::apply_shading(color, normal, x),
-        }
+    /// Shades a flat-colored triangle at `position` (world space) with `normal`
+    /// (unit length, world space), summing the contribution of all lights.
+    fn apply_shading_multiple_lights(
+        color: &Color,
+        position: &Point3,
+        normal: &Point3,
+        lights: &[Light],
+    ) -> Color {
+        let mut light = (Light::AMBIENT, Light::AMBIENT, Light::AMBIENT);
+        lights.iter().for_each(|a| {
+            let d = match a {
+                Light::Point(x) => x.diffuse(position, normal),
+            };
+            light.0 += d.0;
+            light.1 += d.1;
+            light.2 += d.2;
+        });
+
+        let base = Color::convert_255_1(color);
+        Color::convert_1_255(&(
+            (base.0 * light.0).clamp(0.0, 1.0),
+            (base.1 * light.1).clamp(0.0, 1.0),
+            (base.2 * light.2).clamp(0.0, 1.0),
+            base.3,
+        ))
     }
 
     pub fn unwrap_point(&self) -> Option<PointLight> {
@@ -713,7 +708,7 @@ impl Camera {
     fn perform_transformations(mut point: Point3, camera: &Camera) -> Point3 {
         point = Point3::rotate_x(point, &camera.origin_point, camera.rotations.0);
         point = Point3::rotate_y(point, &camera.origin_point, camera.rotations.1);
-        point = Point3::rotate_z(point, &camera.origin_point, camera.rotations.0);
+        point = Point3::rotate_z(point, &camera.origin_point, camera.rotations.2);
         point.x -= camera.origin_point.x;
         point.y -= camera.origin_point.y;
         point.z -= camera.origin_point.z;
@@ -775,78 +770,50 @@ impl MeshLoader {
                     z: z.parse()?,
                 });
             } else if line_0 == "f" {
-                let mut p_1: u32;
-                let mut p_2: u32;
-                let mut p_3: u32;
-                let mut normal: Option<Point3> = None;
-                if line_string.contains("//") {
-                    let part_1 = line_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string();
-                    let part_2 = line_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string();
-                    let part_3 = line_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string();
-
-                    let mut part_1_split = part_1.split("//");
-                    let mut part_2_split = part_2.split("//");
-                    let mut part_3_split = part_3.split("//");
-
-                    p_1 = part_1_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string().parse()?;
-                    let _v_1: usize = part_1_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string().parse()?;
-
-                    p_2 = part_2_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string().parse()?;
-                    let v_2: usize = part_2_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string().parse()?;
-
-                    p_3 = part_3_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string().parse()?;
-                    let _v_3: usize = part_3_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string().parse()?;
-
-                    normal = Some(normals[v_2 - 1]);
-                } else {
-                    p_1 = line_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string().parse()?;
-                    p_2 = line_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string().parse()?;
-                    p_3 = line_split.next().expect("cant read file, file is not in the correct format or has been tampered with").to_string().parse()?;
+                // face vertices can be "v", "v/vt", "v//vn" or "v/vt/vn", and a
+                // face can have any number of vertices (quads, n-gons)
+                let msg = "cant read file, file is not in the correct format or has been tampered with";
+                let mut idx: Vec<usize> = Vec::new();
+                let mut normal_idx: Option<usize> = None;
+                for vertex in line_split.filter(|v| !v.is_empty()) {
+                    let mut parts = vertex.split('/');
+                    let v: usize = parts.next().expect(msg).parse()?;
+                    idx.push(v - 1 - amt_of_points);
+                    if let Some(vn) = parts.nth(1) {
+                        if !vn.is_empty() {
+                            normal_idx.get_or_insert(vn.parse()?);
+                        }
+                    }
                 }
-                p_1 -= 1 + amt_of_points as u32;
-                p_2 -= 1 + amt_of_points as u32;
-                p_3 -= 1 + amt_of_points as u32;
-
-                let p = Point3 {
-                    x: (self.0[obj_len - 1].points[p_1 as usize].x
-                        + self.0[obj_len - 1].points[p_2 as usize].x
-                        + self.0[obj_len - 1].points[p_2 as usize].x)
-                        / 3.0,
-                    y: (self.0[obj_len - 1].points[p_1 as usize].y
-                        + self.0[obj_len - 1].points[p_2 as usize].y
-                        + self.0[obj_len - 1].points[p_2 as usize].y)
-                        / 3.0,
-                    z: (self.0[obj_len - 1].points[p_1 as usize].z
-                        + self.0[obj_len - 1].points[p_2 as usize].z
-                        + self.0[obj_len - 1].points[p_2 as usize].z)
-                        / 3.0,
-                };
-                let l = Color {
-                    r: 180,
-                    g: 180,
-                    b: 180,
-                    a: 255,
-                };
-                let n;
-
-                if normal.is_none() {
-                    n = Triangle::calc_normal([
-                        self.0[obj_len - 1].points[p_1 as usize],
-                        self.0[obj_len - 1].points[p_2 as usize],
-                        self.0[obj_len - 1].points[p_3 as usize],
-                    ]);
-                } else {
-                    n = normal.unwrap();
+                if idx.len() < 3 {
+                    return Err(Box::new(MyError));
                 }
-                self.0[obj_len - 1].triangles.push(Triangle {
-                    point1: (p_1 as usize),
-                    point2: (p_2 as usize),
-                    point3: (p_3 as usize),
-                    origin_point: p,
-                    color: (l),
-                    normal: n,
-                    color_baked: None,
-                });
+                let normal = normal_idx.map(|vn| normals[vn - 1]);
+                let mesh = &mut self.0[obj_len - 1];
+
+                // triangulate as a fan around the first vertex
+                for i in 1..idx.len() - 1 {
+                    let (p_1, p_2, p_3) = (idx[0], idx[i], idx[i + 1]);
+                    let (a, b, c) = (mesh.points[p_1], mesh.points[p_2], mesh.points[p_3]);
+                    mesh.triangles.push(Triangle {
+                        point1: p_1,
+                        point2: p_2,
+                        point3: p_3,
+                        origin_point: Point3 {
+                            x: (a.x + b.x + c.x) / 3.0,
+                            y: (a.y + b.y + c.y) / 3.0,
+                            z: (a.z + b.z + c.z) / 3.0,
+                        },
+                        color: Color {
+                            r: 180,
+                            g: 180,
+                            b: 180,
+                            a: 255,
+                        },
+                        normal: normal.unwrap_or_else(|| Triangle::calc_normal([a, b, c])),
+                        color_baked: None,
+                    });
+                }
             }
         }
         Ok(())
@@ -917,60 +884,40 @@ impl SdlRendering for Canvas<Window> {
         Ok(())
     }
 
-    fn draw_triangle_single_threaded(&mut self, mut points_projected: [Point3; 3], color: Color) {
-        if points_projected[1].y < points_projected[0].y {
-            points_projected.swap(0, 1)
-        };
-        if points_projected[2].y < points_projected[0].y {
-            points_projected.swap(2, 0)
-        };
-        if points_projected[2].y < points_projected[1].y {
-            points_projected.swap(2, 1)
-        };
-
-        let m_0_2;
-        let m_0_1;
-        let m_1_2;
-
-        if points_projected[2].x - points_projected[0].x != 0.0 {
-            m_0_2 = (points_projected[2].y - points_projected[0].y)
-                / (points_projected[2].x - points_projected[0].x);
-        } else {
-            m_0_2 = (points_projected[2].y - points_projected[0].y) / (0.1);
+    fn draw_triangle_single_threaded(&mut self, mut points_projected: [Point3; 3], _color: Color) {
+        // sort vertices by y: p[0] is the top, p[2] the bottom
+        points_projected.sort_by(|a, b| a.y.total_cmp(&b.y));
+        let [p0, p1, p2] = points_projected;
+        if !(p0.y.is_finite() && p2.y.is_finite() && p0.x.is_finite() && p1.x.is_finite() && p2.x.is_finite()) {
+            return;
         }
 
-        if points_projected[1].x - points_projected[0].x != 0.0 {
-            m_0_1 = (points_projected[1].y - points_projected[0].y)
-                / (points_projected[1].x - points_projected[0].x);
-        } else {
-            m_0_1 = (points_projected[1].y - points_projected[0].y) / (0.1);
-        }
+        // x on the edge a->b at scanline y (edge must not be horizontal)
+        let edge_x = |a: &Point3, b: &Point3, y: f32| a.x + (y - a.y) * (b.x - a.x) / (b.y - a.y);
 
-        if points_projected[2].x - points_projected[1].x != 0.0 {
-            m_1_2 = (points_projected[2].y - points_projected[1].y)
-                / (points_projected[2].x - points_projected[1].x);
-        } else {
-            m_1_2 = (points_projected[2].y - points_projected[1].y) / (0.1);
-        }
+        // clamp to the screen so triangles partially off-screen (or near the
+        // camera, where projected coords explode) don't loop over billions of pixels
+        let (w, h) = self.window().size();
+        let (max_x, max_y) = (w as i32 - 1, h as i32 - 1);
+        let y_start = (p0.y.ceil() as i32).max(0);
+        let y_end = (p2.y.floor() as i32).min(max_y);
 
-        let b_0_2 = points_projected[0].y - m_0_2 * points_projected[0].x;
-        let b_0_1 = points_projected[0].y - m_0_1 * points_projected[0].x;
-        let b_1_2 = points_projected[1].y - m_1_2 * points_projected[1].x;
+        for y in y_start..=y_end {
+            let yf = y as f32;
+            let long_x = edge_x(&p0, &p2, yf);
+            // upper half uses edge 0-1, lower half uses edge 1-2
+            let short_x = if yf < p1.y && p1.y > p0.y {
+                edge_x(&p0, &p1, yf)
+            } else if p2.y > p1.y {
+                edge_x(&p1, &p2, yf)
+            } else {
+                long_x
+            };
 
-        for y in points_projected[0].y as i32 + 1..=points_projected[1].y as i32 {
-            let left_x = -((b_0_1 - y as f32) / m_0_1);
-            let right_x = -((b_0_2 - y as f32) / m_0_2);
-
-            for x in f32::min(left_x, right_x) as i32..=f32::max(left_x, right_x) as i32 {
-                self.draw_point(Point::new(x, y)).unwrap();
-            }
-        }
-        for y in points_projected[1].y as i32 + 1..=points_projected[2].y as i32 {
-            let left_x = -((b_1_2 - y as f32) / m_1_2);
-            let right_x = -((b_0_2 - y as f32) / m_0_2);
-
-            for x in f32::min(left_x, right_x) as i32..=f32::max(left_x, right_x) as i32 {
-                self.draw_point(Point::new(x, y)).unwrap();
+            let x0 = (f32::min(long_x, short_x).floor() as i32).max(0);
+            let x1 = (f32::max(long_x, short_x).ceil() as i32).min(max_x);
+            if x0 <= x1 {
+                let _ = self.draw_line(Point::new(x0, y), Point::new(x1, y));
             }
         }
     }
@@ -1001,7 +948,6 @@ impl SdlWrapper for Canvas<Window> {
             lights: &Vec<Light>,
             amt_threads: usize
         ) -> Result<(), ()> {
-            let start: Instant = Instant::now();
             let check = buffer.sort_triangles_in_mesh_origin_point_z_distance_from_camera(camera);
             if check == Err(()) {
                 return Err(());
@@ -1010,7 +956,7 @@ impl SdlWrapper for Canvas<Window> {
         let triangles_mutex = Mutex::new(
             buffer
                 .triangles
-                .chunks(buffer.triangles.len() / amt_threads as usize),
+                .chunks((buffer.triangles.len() / amt_threads.max(1)).max(1)),
         );
         let tri_vec: Mutex<Vec<(Point3, Point3, Point3, Color)>> = Mutex::new(vec![]);
         let points = buffer.points;
@@ -1049,7 +995,7 @@ impl SdlWrapper for Canvas<Window> {
                                     triangle.point2,
                                     triangle.point3,
                                     Light::apply_shading_multiple_lights(
-                                        &tri.color, &tri.normal, lights,
+                                        &tri.color, &tri.origin_point, &tri.normal, lights,
                                     ),
                                 ))
                             } else if tri.color_baked.is_some() {
@@ -1078,8 +1024,6 @@ impl SdlWrapper for Canvas<Window> {
             self.set_draw_color(a.3);
             self.draw_triangle_single_threaded([a.0, a.1, a.2], a.3)
         });
-        let duration: std::time::Duration = start.elapsed();
-        println!("draw_triangles: {:#?}", duration);
         Ok(())
     }
 
@@ -1113,6 +1057,7 @@ impl SdlWrapper for Canvas<Window> {
             if !lights.is_empty() && tri.color_baked.is_none() {
                 let color = Light::apply_shading_multiple_lights(
                     &tri.color,
+                    &tri.origin_point,
                     &tri.normal,
                     lights,
                 ); 
